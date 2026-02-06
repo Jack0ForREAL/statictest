@@ -10,6 +10,7 @@
 
 using json = nlohmann::json;
 
+// --- NTAPI ---
 typedef LONG(NTAPI* pNtSuspendProcess)(HANDLE ProcessHandle);
 typedef LONG(NTAPI* pNtResumeProcess)(HANDLE ProcessHandle);
 pNtSuspendProcess NtSuspendProcess = (pNtSuspendProcess)GetProcAddress(GetModuleHandleA("ntdll"), "NtSuspendProcess");
@@ -29,18 +30,6 @@ DWORD GetPID(const char* procName) {
     return pid;
 }
 
-size_t GetMemoryUsage(DWORD pid) {
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-    if (hProcess == NULL) return 0;
-    PROCESS_MEMORY_COUNTERS pmc;
-    size_t mem = 0;
-    if (GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc))) {
-        mem = pmc.WorkingSetSize;
-    }
-    CloseHandle(hProcess);
-    return mem;
-}
-
 uintptr_t GetModuleBase(DWORD pid, const char* name) {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
     if (snapshot == INVALID_HANDLE_VALUE) return 0;
@@ -53,134 +42,148 @@ uintptr_t GetModuleBase(DWORD pid, const char* name) {
     return base;
 }
 
-uintptr_t FindPattern(HANDLE hProc, uintptr_t base, const char* pattern, const char* mask) {
-    size_t size = 0x5000000; // 80MB
-    std::vector<uint8_t> data(size);
-    SIZE_T read;
-    if (!ReadProcessMemory(hProc, (LPCVOID)base, data.data(), size, &read)) return 0;
-    size_t patternLen = strlen(mask);
-    for (size_t i = 0; i < read - patternLen; i++) {
-        bool found = true;
-        for (size_t j = 0; j < patternLen; j++) {
-            if (mask[j] != '?' && (uint8_t)pattern[j] != data[i + j]) { found = false; break; }
+// --- SAFE MEMORY READ ---
+// This function asks Windows if the memory is readable before touching it.
+// Prevents the "Instant Crash".
+bool SafeRead(HANDLE hProc, uintptr_t addr, void* buffer, size_t size) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQueryEx(hProc, (LPCVOID)addr, &mbi, sizeof(mbi))) {
+        // Check if memory is Committed (Active) and Readable
+        if (mbi.State == MEM_COMMIT && 
+           (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
+            return ReadProcessMemory(hProc, (LPCVOID)addr, buffer, size, NULL);
         }
-        if (found) return base + i;
+    }
+    return false;
+}
+
+// --- SAFE SCANNER ---
+uintptr_t FindPatternSafe(HANDLE hProc, uintptr_t start, size_t range, const char* pattern, const char* mask) {
+    size_t chunkSize = 4096; // Scan in 4KB pages
+    std::vector<uint8_t> buffer(chunkSize);
+    size_t patternLen = strlen(mask);
+
+    for (size_t i = 0; i < range; i += chunkSize) {
+        if (SafeRead(hProc, start + i, buffer.data(), chunkSize)) {
+            for (size_t j = 0; j < chunkSize - patternLen; j++) {
+                bool found = true;
+                for (size_t k = 0; k < patternLen; k++) {
+                    if (mask[k] != '?' && (uint8_t)pattern[k] != buffer[j + k]) {
+                        found = false;
+                        break;
+                    }
+                }
+                if (found) return start + i + j;
+            }
+        }
     }
     return 0;
 }
 
 int main() {
-    std::cout << "[*] GHOST SNIPER v7: Waiting for Roblox..." << std::endl;
+    std::cout << "[*] STABLE SNIPER v8: Waiting for Roblox..." << std::endl;
     
     DWORD pid = 0;
-    while (!(pid = GetPID("RobloxPlayerBeta.exe"))) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
+    while (!(pid = GetPID("RobloxPlayerBeta.exe"))) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
 
     HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    if (!hProc) {
-        std::cout << "[-] Failed to open handle (Admin needed?)" << std::endl;
-        return 1;
+    
+    // SAFETY: Wait for 15MB RAM usage. 
+    // This ensures the game executable is actually loaded.
+    std::cout << "[!] Process Found. Waiting for initialization..." << std::endl;
+    PROCESS_MEMORY_COUNTERS pmc;
+    while (true) {
+        if (GetProcessMemoryInfo(hProc, &pmc, sizeof(pmc))) {
+            if (pmc.WorkingSetSize > 15 * 1024 * 1024) break; // Wait for 15MB
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    std::cout << "[!] Process Detected. Waiting for memory to map..." << std::endl;
+    std::cout << "[!] Target Ready. Engaging Stutter-Step..." << std::endl;
 
-    // SAFETY GUARD: Wait until Roblox hits 20MB usage
-    // This ensures the game code is actually in RAM and readable
-    while (GetMemoryUsage(pid) < (20 * 1024 * 1024)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-
-    std::cout << "[!] Catching wave..." << std::endl;
-    NtSuspendProcess(hProc); 
-
-    uintptr_t base = GetModuleBase(pid, "RobloxPlayerBeta.exe");
-    if (!base) {
-        std::cout << "[-] Base not found. Resuming..." << std::endl;
-        NtResumeProcess(hProc);
-        return 1;
-    }
-
-    uintptr_t sig = FindPattern(hProc, base, "\x48\x83\xEC\x38\x48\x8B\x0D", "xxxxxxx");
-    if (!sig) {
-        std::cout << "[-] Signature not found. Incompatible version?" << std::endl;
-        NtResumeProcess(hProc);
-        return 1;
-    }
-
-    uintptr_t instr = sig + 4;
-    int32_t disp;
-    ReadProcessMemory(hProc, (LPCVOID)(instr + 3), &disp, 4, NULL);
-    uintptr_t singleton_ptr_addr = instr + 7 + disp;
-
-    std::cout << "[*] Signature Found. Pulsing until Flag Map initializes..." << std::endl;
-
+    uintptr_t base = 0;
+    uintptr_t sig = 0;
     uintptr_t singleton = 0;
-    int pulses = 0;
-    while (pulses < 1000) {
-        if (!ReadProcessMemory(hProc, (LPCVOID)singleton_ptr_addr, &singleton, 8, NULL)) break;
+
+    // Try for 500 steps (approx 5 seconds)
+    for (int step = 0; step < 500; step++) {
+        NtSuspendProcess(hProc);
         
-        if (singleton > 0x1000) {
-            uint64_t mask_val = 0;
-            // Map Map starts at singleton + 0x8. Mask is at Map + 0x28
-            if (ReadProcessMemory(hProc, (LPCVOID)(singleton + 0x8 + 0x28), &mask_val, 8, NULL)) {
-                if (mask_val > 0) {
-                    std::cout << "[+] WAVE DETECTED. Pulse: " << pulses << std::endl;
+        base = GetModuleBase(pid, "RobloxPlayerBeta.exe");
+        if (base) {
+            // SAFE SCAN
+            sig = FindPatternSafe(hProc, base, 0x5000000, "\x48\x83\xEC\x38\x48\x8B\x0D", "xxxxxxx");
+            
+            if (sig) {
+                uintptr_t instr = sig + 4;
+                int32_t disp;
+                if (SafeRead(hProc, instr + 3, &disp, 4)) {
+                    uintptr_t ptr = instr + 7 + disp;
+                    SafeRead(hProc, ptr, &singleton, 8);
+                    
+                    if (singleton > 0x1000) {
+                        uint64_t mask_val = 0;
+                        if (SafeRead(hProc, singleton + 0x30, &mask_val, 8)) {
+                            if (mask_val > 0) {
+                                std::cout << "[+] MAP FOUND AT STEP " << step << std::endl;
+                                goto inject; // Jump to injection
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        NtResumeProcess(hProc);
+        // 15ms Sleep matches Python's timing (prevents crash, allows loading)
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+
+    std::cout << "[-] Timed out finding map." << std::endl;
+    NtResumeProcess(hProc);
+    return 0;
+
+inject:
+    std::cout << "[*] Injecting..." << std::endl;
+    std::ifstream file("fflags.json");
+    if (file.is_open()) {
+        json config; file >> config;
+        uintptr_t buckets; SafeRead(hProc, singleton + 0x18, &buckets, 8);
+        uint64_t map_mask; SafeRead(hProc, singleton + 0x30, &map_mask, 8);
+
+        for (auto& it : config.items()) {
+            std::string name = it.key();
+            uint64_t hash = 0xcbf29ce484222325;
+            for (char c : name) { hash ^= (uint64_t)c; hash *= 0x100000001b3; }
+            
+            uintptr_t bucket_addr = buckets + ((hash & map_mask) * 16);
+            uintptr_t node; SafeRead(hProc, bucket_addr + 0x8, &node, 8);
+
+            int safety = 0;
+            while (node != 0 && safety < 100) {
+                uintptr_t name_ptr = node + 0x10;
+                uint64_t s_size; SafeRead(hProc, name_ptr + 0x10, &s_size, 8);
+                if (s_size >= 16) SafeRead(hProc, name_ptr, &name_ptr, 8);
+                
+                char buf[128] = {0};
+                SafeRead(hProc, name_ptr, buf, (s_size > 127 ? 127 : s_size));
+
+                if (name == buf) {
+                    uintptr_t val_root; SafeRead(hProc, node + 0x30, &val_root, 8);
+                    uintptr_t real_val_ptr; SafeRead(hProc, val_root + 0xC0, &real_val_ptr, 8);
+                    
+                    int val = (it.value() == "True" || it.value() == true) ? 1 : it.value().get<int>();
+                    WriteProcessMemory(hProc, (LPVOID)real_val_ptr, &val, sizeof(int), NULL);
+                    std::cout << "  [+] " << name << std::endl;
                     break;
                 }
-            }
-        }
-
-        NtResumeProcess(hProc);
-        std::this_thread::sleep_for(std::chrono::milliseconds(2)); // 2ms pulses
-        NtSuspendProcess(hProc);
-        pulses++;
-    }
-
-    if (singleton > 0x1000) {
-        std::cout << "[!] Injecting flags..." << std::endl;
-        std::ifstream file("fflags.json");
-        if (file.is_open()) {
-            json config; file >> config;
-            uintptr_t map_root = singleton + 0x8;
-            uintptr_t buckets; ReadProcessMemory(hProc, (LPCVOID)(map_root + 0x10), &buckets, 8, NULL);
-            uint64_t map_mask; ReadProcessMemory(hProc, (LPCVOID)(map_root + 0x28), &map_mask, 8, NULL);
-
-            for (auto& it : config.items()) {
-                std::string name = it.key();
-                uint64_t hash = 0xcbf29ce484222325;
-                for (char c : name) { hash ^= (uint64_t)c; hash *= 0x100000001b3; }
-                
-                uintptr_t bucket_addr = buckets + ((hash & map_mask) * 16);
-                uintptr_t node; ReadProcessMemory(hProc, (LPCVOID)(bucket_addr + 0x8), &node, 8, NULL);
-
-                int safety = 0;
-                while (node != 0 && safety < 100) {
-                    uintptr_t name_ptr = node + 0x10;
-                    uint64_t s_size; ReadProcessMemory(hProc, (LPCVOID)(name_ptr + 0x10), &s_size, 8, NULL);
-                    if (s_size >= 16) ReadProcessMemory(hProc, (LPCVOID)name_ptr, &name_ptr, 8, NULL);
-                    
-                    char buf[128] = {0};
-                    ReadProcessMemory(hProc, (LPCVOID)name_ptr, buf, (s_size > 127 ? 127 : s_size), NULL);
-
-                    if (name == buf) {
-                        uintptr_t val_root; ReadProcessMemory(hProc, (LPCVOID)(node + 0x30), &val_root, 8, NULL);
-                        uintptr_t real_val_ptr; ReadProcessMemory(hProc, (LPCVOID)(val_root + 0xC0), &real_val_ptr, 8, NULL);
-                        
-                        int val = (it.value() == "True" || it.value() == true) ? 1 : 0;
-                        if (it.value().is_number()) val = it.value().get<int>();
-
-                        WriteProcessMemory(hProc, (LPVOID)real_val_ptr, &val, sizeof(int), NULL);
-                        std::cout << "  [+] " << name << std::endl;
-                        break;
-                    }
-                    ReadProcessMemory(hProc, (LPCVOID)node, &node, 8, NULL);
-                    safety++;
-                }
+                SafeRead(hProc, node, &node, 8);
+                safety++;
             }
         }
     }
 
-    std::cout << "[!] Done. Resuming Roblox." << std::endl;
+    std::cout << "[!] Done. Resuming." << std::endl;
     NtResumeProcess(hProc);
-    CloseHandle(hProc);
     return 0;
 }
