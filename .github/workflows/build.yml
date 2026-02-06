@@ -1,26 +1,27 @@
-name: Build Sniper
+name: Roblox Sniper Build
 on: [push, workflow_dispatch]
 
 jobs:
   build:
     runs-on: windows-latest
     steps:
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v4
+
+      - name: Setup MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Download JSON Library
         run: |
-          mkdir include
-          Invoke-WebRequest -Uri "https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp" -OutFile "include/json.hpp"
-          mkdir include/nlohmann
-          Copy-Item "include/json.hpp" -Destination "include/nlohmann/json.hpp"
+          mkdir include/nlohmann -Force
+          Invoke-WebRequest -Uri "https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp" -OutFile "include/nlohmann/json.hpp"
 
-      - name: Build with MSVC
+      - name: Compile Sniper
         run: |
           cl.exe /EHsc /I include /O2 main.cpp /link /OUT:sniper.exe user32.lib advapi32.lib
 
-      - name: Upload EXE
+      - name: Upload sniper.exe
         uses: actions/upload-artifact@v4
         with:
-          name: RobloxSniper
+          name: Sniper-Build
           path: sniper.exe
