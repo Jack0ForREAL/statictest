@@ -14,6 +14,7 @@ typedef LONG(NTAPI* pNtResumeProcess)(HANDLE ProcessHandle);
 pNtSuspendProcess NtSuspendProcess = (pNtSuspendProcess)GetProcAddress(GetModuleHandleA("ntdll"), "NtSuspendProcess");
 pNtResumeProcess NtResumeProcess = (pNtResumeProcess)GetProcAddress(GetModuleHandleA("ntdll"), "NtResumeProcess");
 
+// --- GET PID ---
 DWORD GetPID(const char* procName) {
     DWORD pid = 0;
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -27,6 +28,7 @@ DWORD GetPID(const char* procName) {
     return pid;
 }
 
+// --- MODULE BASE (FAST) ---
 uintptr_t GetModuleBase(DWORD pid, const char* name) {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
     if (snapshot == INVALID_HANDLE_VALUE) return 0;
@@ -39,11 +41,11 @@ uintptr_t GetModuleBase(DWORD pid, const char* name) {
     return base;
 }
 
+// --- PATTERN SCAN (ONCE) ---
 uintptr_t FindPattern(HANDLE hProc, uintptr_t base, const char* pattern, const char* mask) {
-    size_t size = 0x4000000; // Scan 64MB
+    size_t size = 0x5000000; 
     std::vector<uint8_t> data(size);
     if (!ReadProcessMemory(hProc, (LPCVOID)base, data.data(), size, NULL)) return 0;
-
     size_t patternLen = strlen(mask);
     for (size_t i = 0; i < size - patternLen; i++) {
         bool found = true;
@@ -56,65 +58,71 @@ uintptr_t FindPattern(HANDLE hProc, uintptr_t base, const char* pattern, const c
 }
 
 int main() {
-    std::cout << "[*] SNIPER START: Waiting for Roblox..." << std::endl;
+    std::cout << "[*] SNIPER v6: Waiting for Roblox..." << std::endl;
     
     DWORD pid = 0;
     while (!(pid = GetPID("RobloxPlayerBeta.exe"))) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
 
     HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    std::cout << "[!] Caught! Freezing process..." << std::endl;
-    NtSuspendProcess(hProc);
+    NtSuspendProcess(hProc); // Catch it at 0.1MB
+    std::cout << "[!] Process Caught. Locating static entry point..." << std::endl;
 
     uintptr_t base = 0;
-    uintptr_t sig = 0;
-    uintptr_t singleton = 0;
+    while (!(base = GetModuleBase(pid, "RobloxPlayerBeta.exe"))) {
+        NtResumeProcess(hProc);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        NtSuspendProcess(hProc);
+    }
 
-    // STEPPING LOOP
-    for (int step = 0; step < 500; step++) {
-        base = GetModuleBase(pid, "RobloxPlayerBeta.exe");
+    // FIND THE SIG ONCE
+    uintptr_t sig = FindPattern(hProc, base, "\x48\x83\xEC\x38\x48\x8B\x0D", "xxxxxxx");
+    if (!sig) {
+        std::cout << "[-] Failed to find signature. Are you using an outdated Roblox?" << std::endl;
+        NtResumeProcess(hProc);
+        return 0;
+    }
+
+    // Resolve the pointer address once
+    uintptr_t instr = sig + 4;
+    int32_t disp;
+    ReadProcessMemory(hProc, (LPCVOID)(instr + 3), &disp, 4, NULL);
+    uintptr_t singleton_ptr_addr = instr + 7 + disp;
+
+    std::cout << "[*] Entry point locked. Pulsing until Map is ready..." << std::endl;
+
+    uintptr_t singleton = 0;
+    int pulses = 0;
+    while (pulses < 1000) {
+        ReadProcessMemory(hProc, (LPCVOID)singleton_ptr_addr, &singleton, 8, NULL);
         
-        if (base) {
-            // If base is found, try to find the Signature
-            sig = FindPattern(hProc, base, "\x48\x83\xEC\x38\x48\x8B\x0D", "xxxxxxx");
-            if (sig) {
-                // If Sig is found, try to find initialized Singleton
-                uintptr_t instr = sig + 4;
-                int32_t disp;
-                ReadProcessMemory(hProc, (LPCVOID)(instr + 3), &disp, 4, NULL);
-                uintptr_t ptr = instr + 7 + disp;
-                ReadProcessMemory(hProc, (LPCVOID)ptr, &singleton, 8, NULL);
-                
-                if (singleton > 0x1000) {
-                    uintptr_t map_ptr = singleton + 0x8;
-                    uint64_t mask_val;
-                    ReadProcessMemory(hProc, (LPCVOID)(map_ptr + 0x28), &mask_val, 8, NULL);
-                    if (mask_val > 0) {
-                        std::cout << "[+] Found Map at step " << step << "!" << std::endl;
-                        break;
-                    }
-                }
+        if (singleton > 0x1000) {
+            uint64_t mask_val = 0;
+            ReadProcessMemory(hProc, (LPCVOID)(singleton + 0x30), &mask_val, 8, NULL); // OFF_MAP_MASK (0x28 + 0x8 alignment)
+            
+            if (mask_val > 0) {
+                std::cout << "[+] WAVE DETECTED. Map initialized at Pulse " << pulses << std::endl;
+                break;
             }
         }
 
-        // STUTTER STEP: Resume for 10ms, then Freeze again
+        // MICRO-PULSE: Just 1ms of execution
         NtResumeProcess(hProc);
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
         NtSuspendProcess(hProc);
-        
-        if (step % 20 == 0) std::cout << "[.] Stepping... (Game currently at Stage " << step << ")" << std::endl;
+        pulses++;
     }
 
     if (singleton > 0x1000) {
-        std::cout << "[*] Injecting flags..." << std::endl;
+        std::cout << "[!] Injecting FFlags..." << std::endl;
         std::ifstream file("fflags.json");
         if (file.is_open()) {
             json config; file >> config;
-            uintptr_t map_ptr = singleton + 0x8;
-            uintptr_t buckets; ReadProcessMemory(hProc, (LPCVOID)(map_ptr + 0x10), &buckets, 8, NULL);
-            uint64_t map_mask; ReadProcessMemory(hProc, (LPCVOID)(map_ptr + 0x28), &map_mask, 8, NULL);
+            uintptr_t buckets; ReadProcessMemory(hProc, (LPCVOID)(singleton + 0x18), &buckets, 8, NULL); // OFF_MAP_LIST
+            uint64_t map_mask; ReadProcessMemory(hProc, (LPCVOID)(singleton + 0x30), &map_mask, 8, NULL); // OFF_MAP_MASK
 
             for (auto& it : config.items()) {
                 std::string name = it.key();
+                // FNV-1a
                 uint64_t hash = 0xcbf29ce484222325;
                 for (char c : name) { hash ^= (uint64_t)c; hash *= 0x100000001b3; }
                 
@@ -127,18 +135,16 @@ int main() {
                     uint64_t s_size; ReadProcessMemory(hProc, (LPCVOID)(name_ptr + 0x10), &s_size, 8, NULL);
                     if (s_size >= 16) ReadProcessMemory(hProc, (LPCVOID)name_ptr, &name_ptr, 8, NULL);
                     
-                    char buf[256] = {0};
-                    ReadProcessMemory(hProc, (LPCVOID)name_ptr, buf, (s_size > 255 ? 255 : s_size), NULL);
+                    char buf[128] = {0};
+                    ReadProcessMemory(hProc, (LPCVOID)name_ptr, buf, (s_size > 127 ? 127 : s_size), NULL);
 
-                    if (std::string(buf) == name) {
+                    if (name == buf) {
                         uintptr_t val_root; ReadProcessMemory(hProc, (LPCVOID)(node + 0x30), &val_root, 8, NULL);
                         uintptr_t real_val_ptr; ReadProcessMemory(hProc, (LPCVOID)(val_root + 0xC0), &real_val_ptr, 8, NULL);
                         
-                        int val = (it.value() == "True" || it.value() == true) ? 1 : 0;
-                        if (it.value().is_number()) val = it.value().get<int>();
-
+                        int val = (it.value() == "True" || it.value() == true) ? 1 : it.value().get<int>();
                         WriteProcessMemory(hProc, (LPVOID)real_val_ptr, &val, sizeof(int), NULL);
-                        std::cout << " [+] " << name << " -> " << val << std::endl;
+                        std::cout << "  [+] " << name << std::endl;
                         break;
                     }
                     ReadProcessMemory(hProc, (LPCVOID)node, &node, 8, NULL);
@@ -146,11 +152,9 @@ int main() {
                 }
             }
         }
-    } else {
-        std::cout << "[-] Failed to catch map in time." << std::endl;
     }
 
-    std::cout << "[!] Resuming game." << std::endl;
+    std::cout << "[!] Done. Resuming process permanently." << std::endl;
     NtResumeProcess(hProc);
     return 0;
 }
