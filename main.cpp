@@ -76,6 +76,23 @@ uintptr_t FindPattern(HANDLE hProc, uintptr_t start, size_t size, const char* pa
     return 0;
 }
 
+// Helper to find the pointer address (Does not return the value, but the location of the pointer)
+uintptr_t ScanForSingletonPtr(HANDLE hProc, DWORD pid) {
+    uintptr_t base = 0;
+    DWORD size = 0;
+    if (!GetModuleInfo(pid, "RobloxPlayerBeta.exe", base, size)) return 0;
+    
+    uintptr_t sig = FindPattern(hProc, base, size, "\x48\x83\xEC\x38\x48\x8B\x0D", "xxxxxxx");
+    if (!sig) return 0;
+
+    uintptr_t instr = sig + 4;
+    int32_t disp;
+    if (ReadProcessMemory(hProc, (LPCVOID)(instr + 3), &disp, 4, NULL)) {
+        return instr + 7 + disp; // Return address of the singleton pointer
+    }
+    return 0;
+}
+
 uint64_t fnv1a(const std::string& str) {
     uint64_t hash = 0xcbf29ce484222325;
     for (char c : str) { hash ^= (uint64_t)c; hash *= 0x100000001b3; }
@@ -97,7 +114,6 @@ int InjectFlags(HANDLE hProc, uintptr_t singleton_val) {
     json config; file >> config;
     uintptr_t map_ptr = singleton_val + 0x8;
     
-    // Check pointers before reading
     if (!IsMemorySafe(hProc, map_ptr)) return 0;
 
     uintptr_t buckets; ReadProcessMemory(hProc, (LPCVOID)(map_ptr + 0x10), &buckets, 8, NULL);
@@ -131,7 +147,6 @@ int InjectFlags(HANDLE hProc, uintptr_t singleton_val) {
                 uintptr_t name_ptr = node + 0x10;
                 uint64_t s_size; 
                 ReadProcessMemory(hProc, (LPCVOID)(name_ptr + 0x10), &s_size, 8, NULL);
-                
                 if (s_size >= 16) ReadProcessMemory(hProc, (LPCVOID)name_ptr, &name_ptr, 8, NULL);
                 
                 char buf[128] = {0};
@@ -141,7 +156,6 @@ int InjectFlags(HANDLE hProc, uintptr_t singleton_val) {
                     uintptr_t val_root; ReadProcessMemory(hProc, (LPCVOID)(node + 0x30), &val_root, 8, NULL);
                     uintptr_t real_val_ptr; ReadProcessMemory(hProc, (LPCVOID)(val_root + 0xC0), &real_val_ptr, 8, NULL);
                     
-                    // SAFE WRITE CHECK
                     if (IsMemorySafe(hProc, real_val_ptr)) {
                         WriteProcessMemory(hProc, (LPVOID)real_val_ptr, &val, sizeof(int), NULL);
                         hits++;
@@ -159,18 +173,14 @@ int InjectFlags(HANDLE hProc, uintptr_t singleton_val) {
 }
 
 int main() {
-    SetConsoleTitleA("ROBLOX TUNER INJECTOR v14");
+    SetConsoleTitleA("ROBLOX PERSISTENT INJECTOR v15");
     
-    // 1. GET USER DELAY
     int user_delay = 0;
     std::cout << "--- CONFIGURATION ---" << std::endl;
     std::cout << "Enter Boot Delay (ms) [Default: 0]: ";
-    if (std::cin.peek() == '\n') {
-        user_delay = 0; // Default
-    } else {
-        std::cin >> user_delay;
-    }
-    std::cin.ignore(); // clear buffer
+    if (std::cin.peek() == '\n') user_delay = 0;
+    else std::cin >> user_delay;
+    std::cin.ignore();
 
     while (true) {
         system("cls");
@@ -180,10 +190,8 @@ int main() {
         while (!(pid = GetPID("RobloxPlayerBeta.exe"))) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
 
         HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+        std::cout << "[!] Process Detected (PID: " << pid << "). Waiting for 20MB..." << std::endl;
         
-        std::cout << "[!] Process Detected. Waiting for 20MB Init..." << std::endl;
-        
-        // --- PRE-BOOT WAIT ---
         PROCESS_MEMORY_COUNTERS pmc;
         while (true) {
             if (!GetProcessMemoryInfo(hProc, &pmc, sizeof(pmc))) goto reset;
@@ -191,50 +199,36 @@ int main() {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
-        // USER DELAY
-        if (user_delay > 0) {
-            std::cout << "[*] Sleeping " << user_delay << "ms (User Config)..." << std::endl;
-            std::this_thread::sleep_for(std::chrono::milliseconds(user_delay));
-        }
+        if (user_delay > 0) std::this_thread::sleep_for(std::chrono::milliseconds(user_delay));
 
-        uintptr_t base = 0, sig = 0, singleton_ptr = 0;
-        DWORD modSize = 0;
-        bool boot_injected = false;
+        // --- BOOT PHASE ---
+        std::cout << "[*] Starting Boot Pulse..." << std::endl;
+        uintptr_t singleton_ptr_addr = 0;
+        bool boot_success = false;
 
-        std::cout << "[*] Starting Pulse Injection..." << std::endl;
-
-        // --- PULSE LOOP (5 Seconds) ---
         for (int i = 0; i < 200; i++) {
             NtSuspendProcess(hProc);
             
-            if (GetModuleInfo(pid, "RobloxPlayerBeta.exe", base, modSize)) {
-                if (!sig) {
-                    sig = FindPattern(hProc, base, modSize, "\x48\x83\xEC\x38\x48\x8B\x0D", "xxxxxxx");
-                    if (sig) {
-                        std::cout << "[DEBUG] Sig Found: " << std::hex << sig << std::dec << std::endl;
-                        uintptr_t instr = sig + 4;
-                        int32_t disp;
-                        ReadProcessMemory(hProc, (LPCVOID)(instr + 3), &disp, 4, NULL);
-                        singleton_ptr = instr + 7 + disp;
-                    }
-                }
+            // Lazy scan: Only scan if we haven't found the address yet
+            if (singleton_ptr_addr == 0) {
+                singleton_ptr_addr = ScanForSingletonPtr(hProc, pid);
+            }
 
-                if (sig) {
-                    uintptr_t singleton_val = 0;
-                    ReadProcessMemory(hProc, (LPCVOID)singleton_ptr, &singleton_val, 8, NULL);
+            if (singleton_ptr_addr != 0) {
+                uintptr_t singleton_val = 0;
+                ReadProcessMemory(hProc, (LPCVOID)singleton_ptr_addr, &singleton_val, 8, NULL);
+                
+                if (singleton_val > 0x1000) {
+                    uint64_t mask = 0;
+                    ReadProcessMemory(hProc, (LPCVOID)(singleton_val + 0x30), &mask, 8, NULL);
                     
-                    if (singleton_val > 0x1000) {
-                        uint64_t mask = 0;
-                        ReadProcessMemory(hProc, (LPCVOID)(singleton_val + 0x30), &mask, 8, NULL);
-                        
-                        if (mask > 0) {
-                            int hits = InjectFlags(hProc, singleton_val);
-                            if (hits > 0) {
-                                std::cout << "[+] BOOT INJECTED: " << hits << " flags set!" << std::endl;
-                                boot_injected = true;
-                                NtResumeProcess(hProc);
-                                break; // EXIT LOOP ON SUCCESS
-                            }
+                    if (mask > 0) {
+                        int hits = InjectFlags(hProc, singleton_val);
+                        if (hits > 0) {
+                            std::cout << "[+] BOOT INJECTION: " << hits << " flags set." << std::endl;
+                            boot_success = true;
+                            NtResumeProcess(hProc);
+                            break; 
                         }
                     }
                 }
@@ -243,9 +237,13 @@ int main() {
             std::this_thread::sleep_for(std::chrono::milliseconds(25));
         }
 
-        // --- RUNTIME LOOP ---
+        if (!boot_success) std::cout << "[-] Boot Phase timed out (Game loaded too fast)." << std::endl;
+
+        // --- RUNTIME PHASE ---
         std::cout << "\n--- GAME RUNNING ---" << std::endl;
-        std::cout << "Press [ENTER] to inject Runtime Flags." << std::endl;
+        std::cout << "Press [ENTER] to Inject. (No Freeze)" << std::endl;
+
+        while (_kbhit()) _getch(); // Clear buffer
 
         while (true) {
             DWORD exitCode;
@@ -259,21 +257,34 @@ int main() {
             if (_kbhit()) {
                 char ch = _getch();
                 if (ch == 13) {
-                    std::cout << "\n[>] Freezing for Runtime Injection..." << std::endl;
-                    NtSuspendProcess(hProc);
+                    std::cout << "\n[>] Injecting Runtime..." << std::endl;
                     
                     uintptr_t current_singleton_val = 0;
-                    // Always re-read the pointer in case of rehash
-                    if (ReadProcessMemory(hProc, (LPCVOID)singleton_ptr, &current_singleton_val, 8, NULL)) {
-                        std::cout << "[DEBUG] Map Ptr: " << std::hex << current_singleton_val << std::dec << std::endl;
+                    bool read_ok = false;
+
+                    // 1. Try old pointer
+                    if (singleton_ptr_addr != 0) {
+                        ReadProcessMemory(hProc, (LPCVOID)singleton_ptr_addr, &current_singleton_val, 8, NULL);
+                        if (current_singleton_val > 0x1000) read_ok = true;
+                    }
+
+                    // 2. If invalid, RE-SCAN (Rehash recovery)
+                    if (!read_ok) {
+                        std::cout << "[*] Pointer invalid/moved. Re-scanning..." << std::endl;
+                        singleton_ptr_addr = ScanForSingletonPtr(hProc, pid);
+                        if (singleton_ptr_addr != 0) {
+                            ReadProcessMemory(hProc, (LPCVOID)singleton_ptr_addr, &current_singleton_val, 8, NULL);
+                            read_ok = true;
+                        }
+                    }
+
+                    // 3. Inject
+                    if (read_ok) {
                         int hits = InjectFlags(hProc, current_singleton_val);
                         std::cout << "[+] Result: " << hits << " flags set." << std::endl;
                     } else {
-                        std::cout << "[-] Error reading map pointer." << std::endl;
+                        std::cout << "[-] Could not find Flag Map." << std::endl;
                     }
-
-                    NtResumeProcess(hProc);
-                    std::cout << "[!] Resumed." << std::endl;
                 }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
