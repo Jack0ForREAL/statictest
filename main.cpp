@@ -5,7 +5,7 @@
 #include <fstream>
 #include <thread>
 #include <tlhelp32.h>
-#include <psapi.h> // Linked via build.yml
+#include <psapi.h>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -15,7 +15,6 @@ typedef LONG(NTAPI* pNtResumeProcess)(HANDLE ProcessHandle);
 pNtSuspendProcess NtSuspendProcess = (pNtSuspendProcess)GetProcAddress(GetModuleHandleA("ntdll"), "NtSuspendProcess");
 pNtResumeProcess NtResumeProcess = (pNtResumeProcess)GetProcAddress(GetModuleHandleA("ntdll"), "NtResumeProcess");
 
-// --- UTILS ---
 DWORD GetPID(const char* procName) {
     DWORD pid = 0;
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -29,42 +28,30 @@ DWORD GetPID(const char* procName) {
     return pid;
 }
 
-// Get the exact base and size of the module to prevent bad scans
+// Check exact module size to be safe
 bool GetModuleInfo(DWORD pid, const char* name, uintptr_t& base, DWORD& size) {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
     if (snapshot == INVALID_HANDLE_VALUE) return false;
     MODULEENTRY32 me; me.dwSize = sizeof(me);
     bool found = false;
     if (Module32First(snapshot, &me)) {
-        do { 
-            if (_stricmp(me.szModule, name) == 0) { 
-                base = (uintptr_t)me.modBaseAddr; 
-                size = me.modBaseSize;
-                found = true;
-                break; 
-            } 
-        } while (Module32Next(snapshot, &me));
+        do { if (_stricmp(me.szModule, name) == 0) { base = (uintptr_t)me.modBaseAddr; size = me.modBaseSize; found = true; break; } } while (Module32Next(snapshot, &me));
     }
     CloseHandle(snapshot);
     return found;
 }
 
-// Scan exact memory range
 uintptr_t FindPattern(HANDLE hProc, uintptr_t start, size_t size, const char* pattern, const char* mask) {
-    size_t chunkSize = 4096 * 16; // 64KB chunks
+    size_t chunkSize = 4096 * 32; // 128KB chunks
     std::vector<uint8_t> buffer(chunkSize);
     size_t patternLen = strlen(mask);
-
     for (size_t i = 0; i < size; i += chunkSize) {
         SIZE_T read;
         if (ReadProcessMemory(hProc, (LPCVOID)(start + i), buffer.data(), chunkSize, &read)) {
             for (size_t j = 0; j < read - patternLen; j++) {
                 bool found = true;
                 for (size_t k = 0; k < patternLen; k++) {
-                    if (mask[k] != '?' && (uint8_t)pattern[k] != buffer[j + k]) {
-                        found = false;
-                        break;
-                    }
+                    if (mask[k] != '?' && (uint8_t)pattern[k] != buffer[j + k]) { found = false; break; }
                 }
                 if (found) return start + i + j;
             }
@@ -74,15 +61,15 @@ uintptr_t FindPattern(HANDLE hProc, uintptr_t start, size_t size, const char* pa
 }
 
 int main() {
-    std::cout << "[*] SNIPER v10 DEBUG: Waiting for Roblox..." << std::endl;
+    std::cout << "--- ROBLOX C++ BOOT INJECTOR v11 ---" << std::endl;
+    std::cout << "[*] Waiting for Roblox..." << std::endl;
     
     DWORD pid = 0;
     while (!(pid = GetPID("RobloxPlayerBeta.exe"))) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
 
     HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     
-    // WAIT FOR 20MB (Safety)
-    std::cout << "[!] Found PID: " << pid << ". Waiting for 20MB RAM..." << std::endl;
+    std::cout << "[!] Found PID: " << pid << ". Waiting for 20MB..." << std::endl;
     PROCESS_MEMORY_COUNTERS pmc;
     while (true) {
         GetProcessMemoryInfo(hProc, &pmc, sizeof(pmc));
@@ -90,29 +77,23 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    std::cout << "[!] Memory Threshold Reached. Starting Scan Loop..." << std::endl;
+    std::cout << "[!] Ready. Engaging Loop..." << std::endl;
 
     uintptr_t base = 0;
     DWORD modSize = 0;
     uintptr_t sig = 0;
 
-    // TRY FOR 5 SECONDS
     for (int i = 0; i < 500; i++) {
         NtSuspendProcess(hProc);
         
         if (GetModuleInfo(pid, "RobloxPlayerBeta.exe", base, modSize)) {
-            // SCAN ONLY ONCE IF FOUND
-            if (!sig) {
-                sig = FindPattern(hProc, base, modSize, "\x48\x83\xEC\x38\x48\x8B\x0D", "xxxxxxx");
-                if (sig) std::cout << "[DEBUG] Sig Found at: " << std::hex << sig << std::endl;
-            }
-
+            if (!sig) sig = FindPattern(hProc, base, modSize, "\x48\x83\xEC\x38\x48\x8B\x0D", "xxxxxxx");
+            
             if (sig) {
                 uintptr_t instr = sig + 4;
                 int32_t disp;
                 ReadProcessMemory(hProc, (LPCVOID)(instr + 3), &disp, 4, NULL);
                 uintptr_t singleton_ptr = instr + 7 + disp;
-                
                 uintptr_t singleton_val = 0;
                 ReadProcessMemory(hProc, (LPCVOID)singleton_ptr, &singleton_val, 8, NULL);
 
@@ -120,17 +101,19 @@ int main() {
                     uint64_t mask = 0;
                     ReadProcessMemory(hProc, (LPCVOID)(singleton_val + 0x30), &mask, 8, NULL);
                     
-                    // ONLY BREAK IF MAP IS POPULATED
                     if (mask > 0) {
-                        std::cout << "[+] MAP READY! Mask: " << mask << std::endl;
+                        std::cout << "[+] MAP FOUND! (Mask: " << std::hex << mask << ")" << std::endl;
                         
-                        // INJECT HERE
+                        // INJECTION
                         std::ifstream file("fflags.json");
-                        if (file.is_open()) {
+                        if (!file.good()) {
+                            std::cout << "[ERROR] fflags.json NOT FOUND in current folder!" << std::endl;
+                        } else {
                             json config; file >> config;
                             uintptr_t buckets; ReadProcessMemory(hProc, (LPCVOID)(singleton_val + 0x18), &buckets, 8, NULL);
                             
                             std::cout << "[*] Injecting " << config.size() << " flags..." << std::endl;
+                            int hits = 0;
 
                             for (auto& it : config.items()) {
                                 std::string name = it.key();
@@ -157,27 +140,30 @@ int main() {
                                         if (it.value().is_number()) val = it.value().get<int>();
 
                                         WriteProcessMemory(hProc, (LPVOID)real_val_ptr, &val, sizeof(int), NULL);
-                                        std::cout << "  [+] " << name << " -> " << val << std::endl;
+                                        std::cout << "  [OK] " << name << " -> " << val << std::endl;
+                                        hits++;
                                         break;
                                     }
                                     ReadProcessMemory(hProc, (LPCVOID)node, &node, 8, NULL);
                                     safety++;
                                 }
                             }
+                            std::cout << "[!] Total Injected: " << hits << "/" << config.size() << std::endl;
                         }
-                        
+
                         NtResumeProcess(hProc);
-                        return 0; // EXIT SUCCESS
+                        std::cout << "\n[SUCCESS] Game Resumed. You may now close this window." << std::endl;
+                        system("pause"); // KEEPS WINDOW OPEN
+                        return 0; 
                     }
                 }
             }
         }
-
         NtResumeProcess(hProc);
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
-
-    std::cout << "[-] TIMEOUT: Sig Found? " << (sig ? "YES" : "NO") << std::endl;
-    NtResumeProcess(hProc);
+    
+    std::cout << "[-] Timed out finding map." << std::endl;
+    system("pause");
     return 0;
 }
